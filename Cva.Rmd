@@ -1,0 +1,600 @@
+---
+title: "Counterparty Credit Risk and CVA Modelling"
+author: "Gautam"
+date: "2026-05-24"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 9, fig.height = 5)
+```
+
+# Introduction
+
+This project calculates the unilateral Credit Valuation Adjustment (CVA) for a derivatives portfolio against Deutsche Bank, made up of:
+
+-   a 3-year EUR/PLN FX Forward, notional 1,000,000 EUR, strike 4.4439, and
+-   a 3-year EUR receiver Interest Rate Swap on EURIBOR 3M, notional 10,000,000 EUR, fixed rate 2.02 percent.
+
+CVA formula:
+
+$$
+CVA \;=\; (1-R) \sum_{i=1}^{N} EE(t_i) \cdot DF(0,t_i) \cdot q(t_{i-1}, t_i)
+$$
+
+# Setup
+
+```{r libs}
+# install.packages(c("readxl","dplyr"))
+library(readxl); library(dplyr)
+options(scipen = 999)
+```
+
+# Market Data
+
+```{r read-data}
+raw_data <- read_excel(
+  "/Users/gautamprasad/Desktop/masters/sem 4/Quantitative finance - project/5/finalforme.xlsx",
+  sheet = "Market data"
+)
+```
+
+## Market reference data
+
+```{r market-data}
+market_data <- raw_data %>%
+  select(Month, EUR_Rate, PLN_rate, EUR_DF, PLN_DF, `EUR/PLN`) %>% na.omit()
+saveRDS(market_data, "market_data.rds")
+head(market_data)
+```
+
+## FX historical series
+
+```{r fx-data}
+fx_data <- raw_data %>% select(Date_fx, Close) %>% na.omit()
+fx_data$Close     <- as.numeric(fx_data$Close)
+fx_data$fx_return <- c(NA, diff(fx_data$Close) / fx_data$Close[-length(fx_data$Close)])
+fx_data <- na.omit(fx_data)
+saveRDS(fx_data, "fx_data.rds")
+head(fx_data)
+```
+
+## IRS historical series
+
+```{r irs-data}
+irs_data <- raw_data %>% select(Date_irs, irs_eurobor3m) %>% na.omit()
+irs_data$irs_eurobor3m <- as.numeric(irs_data$irs_eurobor3m)
+irs_data$irs_change    <- c(NA, diff(irs_data$irs_eurobor3m) / 100)
+irs_data <- na.omit(irs_data)
+saveRDS(irs_data, "irs_data.rds")
+head(irs_data)
+```
+
+## Correlation between FX returns and IRS changes
+
+```{r correlation}
+correlation_data <- merge(
+  fx_data[, c("Date_fx", "fx_return")],
+  irs_data[, c("Date_irs", "irs_change")],
+  by.x = "Date_fx", by.y = "Date_irs", all = FALSE
+)
+colnames(correlation_data) <- c("Date", "FX_Return", "IRS_Change")
+saveRDS(correlation_data, "correlation_data.rds")
+cat("Historical FX vs IRS correlation:",
+    round(cor(correlation_data$FX_Return, correlation_data$IRS_Change), 4), "\n")
+```
+
+```{r load-rds}
+market_data      <- readRDS("market_data.rds")
+fx_data          <- readRDS("fx_data.rds")
+irs_data         <- readRDS("irs_data.rds")
+correlation_data <- readRDS("correlation_data.rds")
+```
+
+# Model Parameters
+
+```{r params}
+T_h   <- 3
+steps <- 36
+dt    <- 1/12
+n_sim <- 10000
+
+r_pln <- 0.0375
+r_eur <- 0.0200
+
+N_fx  <- 1000000
+N_irs <- 10000000
+K_fx  <- 4.4439
+fixed_rate <- 0.0202
+
+s0_fx           <- tail(fx_data$Close, 1)
+sigma_fx_daily  <- sd(fx_data$fx_return)
+sigma_fx_annual <- sigma_fx_daily * sqrt(252)
+mu_fx           <- r_pln - r_eur
+
+r0_ir           <- tail(irs_data$irs_eurobor3m, 1) / 100
+sigma_ir_daily  <- sd(irs_data$irs_change)
+sigma_ir_annual <- sigma_ir_daily * sqrt(252)
+mu_ir           <- mean(as.numeric(irs_data$irs_change))
+
+time_grid <- seq(0, T_h, by = dt)
+df_eur    <- exp(-r_eur * time_grid)
+df_pln    <- exp(-r_pln * time_grid)
+```
+
+# FX Forward Model
+
+GBM dynamics:
+
+$$
+S_{t+1} \;=\; S_t \exp \!\left[ \left(\mu - \tfrac12 \sigma^2 \right) \Delta t + \sigma \sqrt{\Delta t}\, Z \right]
+$$
+
+```{r fx-sim}
+set.seed(123)
+fx_paths <- matrix(0, nrow = steps + 1, ncol = n_sim)
+fx_paths[1, ] <- s0_fx
+for(i in 2:(steps + 1)) {
+  z <- rnorm(n_sim)
+  fx_paths[i, ] <- fx_paths[i - 1, ] *
+    exp((mu_fx - 0.5 * sigma_fx_annual^2) * dt +
+         sigma_fx_annual * sqrt(dt) * z)
+}
+```
+
+FX Forward valuation (Garman-Kohlhagen):
+
+$$
+V_{FX}(t) \;=\; N_{fx} \left[ S(t) \, e^{-r_{EUR}\,\tau} - K \, e^{-r_{PLN}\,\tau} \right], \quad \tau = T - t
+$$
+
+```{r fx-valuation}
+fx_mtm <- matrix(0, nrow = steps + 1, ncol = n_sim)
+for(i in 1:(steps + 1)) {
+  tau <- T_h - time_grid[i]
+  fx_mtm[i, ] <- N_fx * (
+    fx_paths[i, ] * exp(-r_eur * tau) -
+    K_fx          * exp(-r_pln * tau)
+  )
+}
+fx_EE <- rowMeans(pmax(fx_mtm, 0))
+```
+
+# Interest Rate Swap Model
+
+ABM dynamics:
+
+$$
+r_{t+1} \;=\; r_t + \mu \Delta t + \sigma \sqrt{\Delta t}\, Z
+$$
+
+```{r ir-sim}
+ir_paths <- matrix(0, nrow = steps + 1, ncol = n_sim)
+ir_paths[1, ] <- r0_ir
+for(i in 2:(steps + 1)) {
+  z <- rnorm(n_sim)
+  ir_paths[i, ] <- ir_paths[i - 1, ] +
+                   mu_ir * dt +
+                   sigma_ir_annual * sqrt(dt) * z
+}
+```
+
+IRS valuation in EUR (receiver, set-in-advance, deterministic EUR discounting):
+
+$$
+V_{IRS}(t) \;=\; \sum_{T_k > t} \big[\,\text{Fixed}(T_k) - \text{Floating}(T_k)\,\big] \cdot \frac{P_{EUR}(0,T_k)}{P_{EUR}(0,t)}
+$$
+
+```{r irs-valuation}
+irs_mtm <- matrix(0, nrow = steps + 1, ncol = n_sim)
+for(i in 1:(steps + 1)) {
+  for(j in 1:n_sim) {
+    value <- 0
+    if(i < steps + 1) {
+      for(k in (i + 1):(steps + 1)) {
+        month <- k - 1
+        floating_leg <- 0
+        if(month %% 3 == 0 && month > 0) {
+          reset_idx <- k - 3
+          if(reset_idx >= 1) floating_leg <- N_irs * ir_paths[reset_idx, j] * 0.25
+        }
+        fixed_leg <- 0
+        if(month %% 12 == 0 && month > 0) fixed_leg <- N_irs * fixed_rate
+        cashflow <- fixed_leg - floating_leg
+        df_fwd   <- df_eur[k] / df_eur[i]
+        value    <- value + cashflow * df_fwd
+      }
+    }
+    irs_mtm[i, j] <- value
+  }
+}
+irs_EE <- rowMeans(pmax(irs_mtm, 0))
+```
+
+IRS in PLN (deterministic forward FX):
+
+```{r irs-pln}
+fx_forward_curve <- market_data$`EUR/PLN`
+irs_mtm_pln <- matrix(0, nrow = steps + 1, ncol = n_sim)
+for(i in 1:(steps + 1)) {
+  irs_mtm_pln[i, ] <- irs_mtm[i, ] * fx_forward_curve[i]
+}
+irs_EE_pln <- rowMeans(pmax(irs_mtm_pln, 0))
+```
+
+# Portfolio Exposure
+
+$$
+EE_{port}(t) \;=\; \mathbb{E} \Big[ \max\!\big( MtM_{FX}(t) + MtM_{IRS\,PLN}(t),\; 0 \big) \Big]
+$$
+
+```{r portfolio}
+portfolio_mtm <- fx_mtm + irs_mtm_pln
+portfolio_EE  <- rowMeans(pmax(portfolio_mtm, 0))
+```
+
+# Variation Margin
+
+$$
+VM(T) \;=\; MtM_{FX}(T-1) + MtM_{IRS\,PLN}(T-1), \qquad VM(0) = 0
+$$
+
+$$
+\text{Exposure}_{VM}(T) \;=\; \max\!\big( MtM_{port}(T) - VM(T),\; 0 \big)
+$$
+
+```{r vm}
+vm <- matrix(0, nrow = steps + 1, ncol = n_sim)
+vm[1, ] <- 0
+for(i in 2:(steps + 1)) vm[i, ] <- fx_mtm[i - 1, ] + irs_mtm_pln[i - 1, ]
+vm_exposure <- pmax(portfolio_mtm - vm, 0)
+vm_EE       <- rowMeans(vm_exposure)
+```
+
+# CDS Bootstrap
+
+$$
+S \cdot \sum_{n=1}^{N} DF(0,T_n) \, PS(T_n) \, \Delta t_n
+\;=\;
+(1-R) \cdot \sum_{n=1}^{N} DF(0,T_n) \, [\,PS(T_{n-1}) - PS(T_n)\,]
+$$
+
+```{r cds-bootstrap}
+cdsTenors  <- c(0.5, 1, 2, 3)
+cdsSpreads <- c(0.00305, 0.00394, 0.006935, 0.00967)
+DF         <- exp(-r_eur * cdsTenors)
+RR <- 0.40; LGD <- 1 - RR
+
+PS <- numeric(length(cdsTenors))
+solve_PS <- function(k, PS_prev) {
+  S <- cdsSpreads[k]
+  f <- function(PS_k) {
+    PS_full <- c(1, PS_prev, PS_k); PL <- 0; DL <- 0
+    for(i in 2:(k + 1)) {
+      t_now  <- cdsTenors[i - 1]
+      t_prev <- ifelse(i == 2, 0, cdsTenors[i - 2])
+      dt_cds <- t_now - t_prev
+      DL <- DL + LGD * DF[i - 1] * (PS_full[i - 1] - PS_full[i])
+      PL <- PL + S   * DF[i - 1] *  PS_full[i]    * dt_cds
+    }
+    PL - DL
+  }
+  uniroot(f, c(0.5, 1))$root
+}
+PS[1] <- LGD / (LGD + cdsSpreads[1] * cdsTenors[1])
+for(k in 2:length(cdsTenors)) PS[k] <- solve_PS(k, PS[1:(k - 1)])
+
+t_monthly    <- seq(0, 3, by = 1/12)
+PS_interp    <- approx(c(0, cdsTenors), c(1, PS), xout = t_monthly)$y
+default_prob <- c(0, PS_interp[-length(PS_interp)] - PS_interp[-1])
+
+data.frame(Tenor = cdsTenors, Survival = round(PS, 6))
+```
+
+# CVA Calculation
+
+$$
+CVA \;=\; (1-R) \sum_{i=1}^{N} EE(t_i) \cdot P_{PLN}(0,t_i) \cdot q(t_{i-1}, t_i)
+$$
+
+```{r cva}
+discount_factors <- market_data$PLN_DF[1:37]
+
+CVA_FX        <- LGD * sum(fx_EE        * discount_factors * default_prob)
+CVA_IRS_PLN   <- LGD * sum(irs_EE_pln   * discount_factors * default_prob)
+CVA_PORTFOLIO <- LGD * sum(portfolio_EE * discount_factors * default_prob)
+CVA_VM        <- LGD * sum(vm_EE        * discount_factors * default_prob)
+
+cva_results <- data.frame(
+  Instrument = c("FX Forward", "IRS (PLN)", "Portfolio", "Portfolio with VM"),
+  CVA_PLN    = round(c(CVA_FX, CVA_IRS_PLN, CVA_PORTFOLIO, CVA_VM), 2)
+)
+print(cva_results)
+
+netting_benefit <- 1 - CVA_PORTFOLIO / (CVA_FX + CVA_IRS_PLN)
+vm_efficiency   <- 1 - CVA_VM / CVA_PORTFOLIO
+cat("\nNetting benefit:", round(netting_benefit * 100, 2), "%\n")
+cat("VM efficiency  :", round(vm_efficiency  * 100, 2), "%\n")
+```
+
+# Graphs
+
+```{r graph-globals}
+months <- 0:steps
+n_show <- 50
+```
+
+## Simulated FX paths
+
+```{r g1-fx-paths, fig.height=5}
+par(mar = c(4.5, 4.8, 3.5, 1.5))
+matplot(months, fx_paths[, 1:n_show], type = "l", lty = 1, lwd = 0.8,
+        col = rainbow(n_show, s = 0.85, v = 0.85, alpha = 0.55),
+        xlab = "Month", ylab = "EUR/PLN spot rate",
+        main = "Simulated EUR/PLN exchange rate paths (50 of 10,000)")
+lines(months, rowMeans(fx_paths), col = "black", lwd = 3)
+abline(h = K_fx, col = "red", lty = 2, lwd = 1.8)
+legend("topleft",
+       legend = c("Sample paths", "Mean path", paste("Strike =", K_fx)),
+       col = c("dodgerblue", "black", "red"), lty = c(1, 1, 2),
+       lwd = c(1.5, 3, 1.8), bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## FX Forward MtM paths + mean
+
+```{r g2-fx-mtm, fig.height=5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+matplot(months, fx_mtm[, 1:n_show], type = "l", lty = 1, lwd = 0.8,
+        col = rainbow(n_show, s = 0.85, v = 0.85, alpha = 0.55),
+        xlab = "Month", ylab = "FX Forward MtM (PLN)",
+        main = "FX Forward — simulated MtM paths (50 of 10,000)")
+lines(months, rowMeans(fx_mtm), col = "black", lwd = 3)
+abline(h = 0, col = "gray40", lty = 2)
+legend("topleft", legend = c("Sample paths", "Mean MtM"),
+       col = c("dodgerblue", "black"), lty = 1, lwd = c(1.5, 3),
+       bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## FX Expected Exposure
+
+```{r g3-fx-ee, fig.height=4.5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+plot(months, fx_EE, type = "n",
+     xlab = "Month", ylab = "Expected Exposure (PLN)",
+     main = "FX Forward — Expected Exposure")
+polygon(c(0, months, steps), c(0, fx_EE, 0),
+        col = adjustcolor("steelblue", 0.25), border = NA)
+lines(months, fx_EE, col = "steelblue4", lwd = 2.5)
+points(months, fx_EE, col = "black", pch = 19, cex = 0.9)
+grid(col = "gray90")
+```
+
+## Simulated EURIBOR 3M paths
+
+```{r g4-ir-paths, fig.height=5}
+par(mar = c(4.5, 4.8, 3.5, 1.5))
+matplot(months, ir_paths[, 1:n_show] * 100, type = "l", lty = 1, lwd = 0.8,
+        col = rainbow(n_show, s = 0.85, v = 0.85, alpha = 0.55),
+        xlab = "Month", ylab = "EURIBOR 3M (%)",
+        main = "Simulated EURIBOR 3M paths (50 of 10,000)")
+lines(months, rowMeans(ir_paths) * 100, col = "black", lwd = 3)
+abline(h = fixed_rate * 100, col = "red", lty = 2, lwd = 1.8)
+legend("topleft",
+       legend = c("Sample paths", "Mean rate",
+                  paste0("Fixed = ", fixed_rate * 100, "%")),
+       col = c("darkcyan", "black", "red"), lty = c(1, 1, 2),
+       lwd = c(1.5, 3, 1.8), bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## IRS MtM paths (EUR)
+
+```{r g5-irs-eur, fig.height=5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+matplot(months, irs_mtm[, 1:n_show], type = "l", lty = 1, lwd = 0.8,
+        col = rainbow(n_show, s = 0.85, v = 0.85, alpha = 0.55),
+        xlab = "Month", ylab = "IRS MtM (EUR)",
+        main = "IRS — simulated MtM paths in EUR (50 of 10,000)")
+lines(months, rowMeans(irs_mtm), col = "black", lwd = 3)
+abline(h = 0, col = "gray40", lty = 2)
+legend("topright", legend = c("Sample paths", "Mean MtM"),
+       col = c("forestgreen", "black"), lty = 1, lwd = c(1.5, 3),
+       bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## IRS MtM paths (PLN)
+
+```{r g6-irs-pln, fig.height=5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+matplot(months, irs_mtm_pln[, 1:n_show], type = "l", lty = 1, lwd = 0.8,
+        col = rainbow(n_show, s = 0.85, v = 0.85, alpha = 0.55),
+        xlab = "Month", ylab = "IRS MtM (PLN)",
+        main = "IRS — simulated MtM paths in PLN (50 of 10,000)")
+lines(months, rowMeans(irs_mtm_pln), col = "black", lwd = 3)
+abline(h = 0, col = "gray40", lty = 2)
+legend("topright", legend = c("Sample paths", "Mean MtM"),
+       col = c("forestgreen", "black"), lty = 1, lwd = c(1.5, 3),
+       bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## IRS Expected Exposure (PLN)
+
+```{r g7-irs-ee, fig.height=4.5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+plot(months, irs_EE_pln, type = "n",
+     xlab = "Month", ylab = "Expected Exposure (PLN)",
+     main = "IRS — Expected Exposure in PLN")
+polygon(c(0, months, steps), c(0, irs_EE_pln, 0),
+        col = adjustcolor("forestgreen", 0.25), border = NA)
+lines(months, irs_EE_pln, col = "darkgreen", lwd = 2.5)
+points(months, irs_EE_pln, col = "black", pch = 19, cex = 0.9)
+grid(col = "gray90")
+```
+
+## Portfolio MtM paths
+
+```{r g8-port-paths, fig.height=5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+matplot(months, portfolio_mtm[, 1:n_show], type = "l", lty = 1, lwd = 0.8,
+        col = rainbow(n_show, s = 0.85, v = 0.85, alpha = 0.55),
+        xlab = "Month", ylab = "Portfolio MtM (PLN)",
+        main = "Portfolio — simulated MtM paths (50 of 10,000)")
+lines(months, rowMeans(portfolio_mtm), col = "black", lwd = 3)
+abline(h = 0, col = "gray40", lty = 2)
+legend("topright", legend = c("Sample paths", "Mean MtM"),
+       col = c("purple4", "black"), lty = 1, lwd = c(1.5, 3),
+       bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## Portfolio Expected Exposure
+
+```{r g9-port-ee, fig.height=4.5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+plot(months, portfolio_EE, type = "n",
+     xlab = "Month", ylab = "Expected Exposure (PLN)",
+     main = "Portfolio — Expected Exposure")
+polygon(c(0, months, steps), c(0, portfolio_EE, 0),
+        col = adjustcolor("purple4", 0.25), border = NA)
+lines(months, portfolio_EE, col = "purple4", lwd = 2.5)
+points(months, portfolio_EE, col = "black", pch = 19, cex = 0.9)
+grid(col = "gray90")
+```
+
+## VM residual exposure paths
+
+```{r g10-vm-paths, fig.height=5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+matplot(months, vm_exposure[, 1:n_show], type = "l", lty = 1, lwd = 0.8,
+        col = rainbow(n_show, s = 0.85, v = 0.85, alpha = 0.55),
+        xlab = "Month", ylab = "Residual exposure (PLN)",
+        main = "Portfolio after monthly VM — residual exposure (50 of 10,000)")
+lines(months, vm_EE, col = "black", lwd = 3)
+legend("topright", legend = c("Sample paths", "Mean residual"),
+       col = c("firebrick", "black"), lty = 1, lwd = c(1.5, 3),
+       bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## Portfolio EE: without vs with VM
+
+```{r g11-vs-vm, fig.height=4.5}
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+plot(months, portfolio_EE, type = "l", lwd = 2.5, col = "green",
+     xlab = "Month", ylab = "Expected Exposure (PLN)",
+     main = "Portfolio EE — without vs with monthly VM",
+     ylim = c(0, max(portfolio_EE) * 1.05))
+lines(months, vm_EE, col = "black", lwd = 2.5, lty = 2)
+legend("topright", legend = c("Without VM", "With monthly VM"),
+       col = c("green", "black"), lty = c(1, 2), lwd = 2.5,
+       bg = "white", cex = 0.85)
+grid(col = "gray90")
+```
+
+## CDS survival and default probability
+
+```{r g12-cds, fig.width=10, fig.height=4.5}
+par(mfrow = c(1, 2), mar = c(4.5, 4.8, 3.5, 1.5))
+
+plot(t_monthly, PS_interp, type = "l", lwd = 2.5, col = "steelblue",
+     xlab = "Time (years)", ylab = "Survival PS(t)",
+     main = "CDS-implied survival probability")
+points(cdsTenors, PS, col = "red", pch = 19, cex = 1.3)
+grid(col = "gray90")
+
+plot(t_monthly, default_prob, type = "l", lwd = 2.5, col = "firebrick",
+     xlab = "Time (years)", ylab = "Marginal default q(t)",
+     main = "Monthly marginal default probability")
+grid(col = "gray90")
+
+par(mfrow = c(1, 1))
+```
+
+## CVA summary bar chart
+
+```{r g13-cva-bar, fig.height=5}
+par(mar = c(5, 5.5, 4, 1.5))
+cols <- c("steelblue", "forestgreen", "purple4", "firebrick")
+ymax <- max(cva_results$CVA_PLN) * 1.20
+
+bp <- barplot(cva_results$CVA_PLN,
+              names.arg = cva_results$Instrument,
+              col = cols, border = "white", space = 0.55,
+              ylim = c(0, ymax),
+              xlab = "", ylab = "CVA (PLN)",
+              main = "CVA Comparison — All Four Instruments")
+
+text(bp, cva_results$CVA_PLN,
+     labels = format(round(cva_results$CVA_PLN, 0), big.mark = ","),
+     pos = 3, font = 2, cex = 1.05)
+
+mtext(sprintf("Netting benefit: %.1f%%   |   VM efficiency: %.1f%%",
+              netting_benefit * 100, vm_efficiency * 100),
+      side = 3, line = 0.3, cex = 0.95, col = "gray30")
+grid(nx = NA, ny = NULL, col = "gray90")
+```
+
+## Cumulative CVA accrual
+
+```{r g14-cum-cva, fig.height=4.5}
+monthly_contrib <- portfolio_EE * discount_factors * default_prob * LGD
+cum_cva <- cumsum(monthly_contrib)
+
+par(mar = c(4.5, 5.8, 3.5, 1.5))
+plot(months, cum_cva, type = "n",
+     xlab = "Month", ylab = "Cumulative CVA (PLN)",
+     main = paste0("Cumulative CVA accrual — Portfolio (total = ",
+                   format(round(CVA_PORTFOLIO, 0), big.mark = ","), " PLN)"))
+polygon(c(0, months, steps), c(0, cum_cva, 0),
+        col = adjustcolor("steelblue", 0.30), border = NA)
+lines(months, cum_cva, col = "steelblue4", lwd = 2.5)
+grid(col = "gray90")
+```
+
+### Historical risk factors used for calibration
+
+Visual sanity check on the inputs — confirms that the historical EUR/PLN and EURIBOR 3M data used to calibrate σ are in a reasonable range and free of obvious data errors.
+
+```{r g18-hist-data, fig.width=10, fig.height=4.5}
+par(mfrow = c(1, 2), mar = c(4.5, 4.8, 3.5, 1.5))
+
+plot(fx_data$Date_fx, fx_data$Close, type = "l", lwd = 1.5, col = "steelblue",
+     xlab = "Date", ylab = "EUR/PLN spot",
+     main = "Historical EUR/PLN (2023–2025)")
+grid(col = "gray90")
+
+plot(irs_data$Date_irs, irs_data$irs_eurobor3m, type = "l", lwd = 1.5,
+     col = "forestgreen",
+     xlab = "Date", ylab = "EURIBOR 3M (%)",
+     main = "Historical EURIBOR 3M (2023–2025)")
+grid(col = "gray90")
+
+par(mfrow = c(1, 1))
+```
+
+# Conclusions
+
+-   Single-instrument CVAs show the IRS dominating the credit charge because of its 10x larger notional.
+-   Netting reduces the standalone-sum CVA by about `r round(netting_benefit * 100, 1)` percent.
+-   Monthly Variation Margin further reduces the residual portfolio CVA by about `r round(vm_efficiency * 100, 1)` percent, leaving only the one-period gap-risk component (`r format(round(CVA_VM, 0), big.mark = ",")` PLN).
+-   Residual scales with the square root of the margin period, so shorter margin periods shrink CVA further.
+
+# References
+
+-   Brigo, D., Morini, M., Pallavicini, A. (2013). Counterparty Credit Risk, Collateral and Funding. Wiley.
+-   Gregory, J. (2020). The xVA Challenge (4th ed.). Wiley.
+-   ECB Statistical Data Warehouse. EURIBOR 3M monthly historical series.
+-   Stooq.pl. EUR/PLN daily exchange rates.
+-   Olsza, P. (2026). Credit Valuation Adjustment for Derivative Contracts — Lecture notes.
